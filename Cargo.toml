@@ -1,9 +1,8 @@
 [package]
-name = "panteum-fun"
+name = "symmetrical-fiesta"
 version = "0.1.0"
 authors = ["Ken Ranosa <ken.ranosa@gmail.com>"]
 edition = "2018"
-workspace = ".."
 
 [[bin]]
 name = "websocket-server"

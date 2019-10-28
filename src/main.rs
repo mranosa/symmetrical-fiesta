@@ -2,19 +2,19 @@
 //! Open `http://localhost:8080/ws/index.html` in browser
 //! or [python console client](https://github.com/actix/examples/blob/master/websocket/websocket-client.py)
 //! could be used for testing.
-#[macro_use(lazy_static)]
-extern crate lazy_static;
 extern crate rand;
+
+mod routes;
+mod ipfilter;
 
 use rand::Rng;
 
 use std::time::{Duration, Instant};
 
 use actix::prelude::*;
-use actix_files as fs;
-use actix_web::{error, middleware, web, App, Error, HttpRequest, HttpResponse, HttpServer};
+use actix_web::{middleware, web, App, Error, HttpRequest, HttpResponse, HttpServer};
 use actix_web_actors::ws;
-use futures::future::{ok, err, Future};
+use ipfilter::IpFilter;
 
 use std::sync::Mutex;
 
@@ -23,16 +23,6 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 /// How long before lack of client response causes a timeout
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 
-// SOURCE: https://stackoverflow.com/questions/27791532/how-do-i-create-a-global-mutable-singleton
-// SOURCE: https://stackoverflow.com/questions/29654927/how-do-i-assign-a-string-to-a-mutable-static-variable
-// TODO: Refactor to non-global variable implementation
-// println!("WHITELIST: {:?}", WHITELIST.lock().unwrap());
-lazy_static! {
-    static ref WHITELIST: Mutex<Vec<String>> = Mutex::new(vec![]);
-    static ref SECRET_NUMBER: Mutex<u32> = Mutex::new(generate_random_number());
-    static ref SECRET_NUMBER_USED: Mutex<bool> = Mutex::new(false);
-}
-
 fn generate_random_number() -> u32 {
     let mut rng = rand::thread_rng();
     let random_number: u32 = rng.gen();
@@ -40,115 +30,27 @@ fn generate_random_number() -> u32 {
     random_number
 }
 
-fn generate_secret_number() {
-    // SOURCE: https://www.reddit.com/r/rust/comments/9wd8s7/how_to_unlock_a_mutex/
-    let mut secret_number = SECRET_NUMBER.lock().unwrap();
-    *secret_number = generate_random_number();
-    std::mem::drop(secret_number);
-
-    let mut secret_number_used = SECRET_NUMBER_USED.lock().unwrap();
-    *secret_number_used = false;
-    std::mem::drop(secret_number_used);
-
-    println!("NEW SECRET NUMBER: {:?}", SECRET_NUMBER.lock().unwrap());
-}
-
-// TODO: How and where to invoke this? on the web page?
-// add_ip("192.168.1.2".to_string());
-fn add_ip(ip: String) {
-    println!("WHITELIST BEFORE: {:?}", WHITELIST.lock().unwrap());
-    WHITELIST.lock().unwrap().push(ip);
-
-
-    println!("WHITELIST AFTER: {:?}", WHITELIST.lock().unwrap());
-
-    // randomly generate new secret number
-    if generate_random_number() % 3 == 0 {
-        generate_secret_number();
-    }
-}
-
-fn remove_ip(ip: String) {
-    let index = WHITELIST.lock().unwrap().iter().position(|x| *x == ip).unwrap();
-    WHITELIST.lock().unwrap().remove(index);
-}
-
-fn whitelist() -> Box<dyn Future<Item = HttpResponse, Error = Error>> {
-    // SOURCE:  https://stackoverflow.com/questions/48102662/use-all-but-the-last-element-from-an-iterator
-    let mut whitelist_str = String::new();
-    let ips = WHITELIST.lock().unwrap();
-    let mut chunks = ips.chunks(2).peekable();
-    let mut is_last = false;
-
-    while let Some(chunk) = chunks.next() {
-        if !chunks.peek().is_some() {
-            is_last = true;
-        }
-
-        for ip in chunk.iter() {
-            whitelist_str.push_str(&ip.to_string());
-            if !is_last {
-                whitelist_str.push_str(", ");
-            }
-        }
-    }
-
-    println!("WHITELIST: {:?}", whitelist_str);
-
-    Box::new(ok::<_, Error>(
-        HttpResponse::Ok().content_type("text/html").body(whitelist_str),
-    ))
-}
-
-fn secret() -> Box<dyn Future<Item = HttpResponse, Error = Error>> {
-    let secret_number = SECRET_NUMBER.lock().unwrap().to_string();;
-
-    println!("secret_number: {:?}", secret_number);
-
-    Box::new(ok::<_, Error>(
-        HttpResponse::Ok().content_type("text/html").body(secret_number),
-    ))
-}
-
-fn exists_in_whitelist(ip: &String) -> bool {
-    let whitelist = WHITELIST.lock().unwrap();
-    
-    if !whitelist.contains(&ip) {
-        return false;
-    }
-
-    return true;
-}
-
-fn secret_number_valid(secret_number: &String) -> bool {
-    let mut is_used_guard = SECRET_NUMBER_USED.lock().unwrap();
-    let is_used = *is_used_guard;
-    std::mem::drop(is_used_guard);
-
-    if SECRET_NUMBER.lock().unwrap().to_string() == secret_number.to_string() && is_used == false {
-        return true;
-    }
-
-    return false;
-}
-
-// SOURCE: https://stackoverflow.com/questions/52919494/is-there-simpler-method-to-get-the-string-value-of-an-actix-web-http-header
-fn get_secret_number<'a>(req: &'a HttpRequest) -> Option<&'a str> {
-    req.headers().get("secret-number")?.to_str().ok()
-}
-
 /// do websocket handshake and start `MyWebSocket` actor
-fn ws_index(r: HttpRequest, stream: web::Payload) -> Result<HttpResponse, Error> {
-    let mut secret_number = "none".to_string();
-    if let Some(num_from_req) = get_secret_number(&r) {
-        secret_number = num_from_req.to_string();
+fn ws_index(data: web::Data<Mutex<IpFilter>>, r: HttpRequest, stream: web::Payload) -> Result<HttpResponse, Error> {
+    // SOURCE: https://stackoverflow.com/questions/52919494/is-there-simpler-method-to-get-the-string-value-of-an-actix-web-http-header
+    fn get_secret_number<'a>(req: &'a HttpRequest) -> Option<&'a str> {
+        req.headers().get("secret-number")?.to_str().ok()
     }
+
+    // get client details
     let connection_info = r.connection_info();
     let remote_address_str = connection_info.remote().unwrap().to_string();
     let remote_address:Vec<&str>= remote_address_str.split(":").collect();
     let ip_address = remote_address[0].to_string();
-    let exist_in_whitelist = exists_in_whitelist(&ip_address);
-    let secret_number_valid = secret_number_valid(&secret_number);
+    let mut secret_number = "none".to_string();
+    if let Some(num_from_req) = get_secret_number(&r) {
+        secret_number = num_from_req.to_string();
+    }
+
+    // validate client details against ip filter
+    let mut ip_filter = data.lock().unwrap();
+    let exist_in_whitelist = ip_filter.exists_in_whitelist(&ip_address) ;
+    let secret_number_valid = ip_filter.is_secret_number_valid(&secret_number);
     let add_to_whitelist = !exist_in_whitelist && secret_number_valid;
     let mut is_authorized = exist_in_whitelist;
 
@@ -157,11 +59,12 @@ fn ws_index(r: HttpRequest, stream: web::Payload) -> Result<HttpResponse, Error>
     println!("-------------> add_to_whitelist {:?}", add_to_whitelist);
 
     if add_to_whitelist {
-        add_ip(ip_address.to_string());
+        ip_filter.add_ip(ip_address);
 
-        let mut secret_number_used = SECRET_NUMBER_USED.lock().unwrap();
-        *secret_number_used = true;
-        std::mem::drop(secret_number_used);
+        // randomly generate new secret number
+        if generate_random_number() % 3 == 0 {
+            ip_filter.new_secret_number(generate_random_number());
+        }
 
         is_authorized = true;        
     }
@@ -246,20 +149,28 @@ fn main() -> std::io::Result<()> {
     std::env::set_var("RUST_LOG", "actix_server=info,actix_web=info");
     env_logger::init();
     
-    // prepare whitelist
-    // add_ip("127.0.0.1".to_string());
-    add_ip("127.0.0.2".to_string());
-    add_ip("127.0.0.3".to_string());
+    let ip_filter = IpFilter{
+        whitelist: vec![
+            "192.192.192.1".to_string(),
+            "192.192.192.2".to_string(),
+            "192.192.192.3".to_string()
+        ],
+        secret_number: generate_random_number(),
+        secret_number_used: false
+    };
+
+    let ip_filter_data = web::Data::new(Mutex::new(ip_filter));
     
-    HttpServer::new(|| {
+    HttpServer::new(move || {
         App::new()
             // enable logger
             .wrap(middleware::Logger::default())
+            .register_data(ip_filter_data.clone())
             // websocket route
             .service(web::resource("/ws/").route(web::get().to(ws_index)))
             // web pages
-            .route("/whitelist", web::to_async(whitelist))
-            .route("/secret", web::to_async(secret))
+            .route("/whitelist", web::to_async(routes::whitelist_page))
+            .route("/secret", web::to_async(routes::secret_page))
     })
     // start http server on 127.0.0.1:8080
     .bind("127.0.0.1:8080")?
